@@ -77,11 +77,32 @@ export class LocalIndex {
     return Array.from(this._chunks.values());
   }
 
-  chunksByKind(kind) {
-    return this.allChunks().filter((chunk) => chunk.kind === kind);
+  /**
+   * Chunks of one kind, optionally limited to one source.
+   *
+   * With a `source` filter the newest row comes first, so "the latest chunk of
+   * this session" is one cheap read instead of a full scan-and-sort.
+   */
+  chunksByKind(kind, { source = null, limit = null } = {}) {
+    let chunks = this.allChunks().filter((chunk) => chunk.kind === kind && (source === null || chunk.source === source));
+    if (source !== null) chunks = chunks.slice().reverse();
+    if (Number.isInteger(limit) && limit > 0) chunks = chunks.slice(0, limit);
+    return chunks;
+  }
+
+  /**
+   * BM25 search returning each hit's own score.
+   * @returns {{chunk: Chunk, score: number}[]} ordered best first.
+   */
+  searchWithScores(query, topK = 20) {
+    return this._score(query, topK).map(({ chunk, score }) => ({ chunk, score }));
   }
 
   search(query, topK = 20) {
+    return this._score(query, topK).map((hit) => hit.chunk);
+  }
+
+  _score(query, topK = 20) {
     if (this._chunks.size === 0) return [];
     const queryTokens = tokenize(query);
     if (queryTokens.length === 0) return [];
@@ -102,7 +123,7 @@ export class LocalIndex {
     return Array.from(scores.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, topK)
-      .map(([docId]) => this._chunks.get(docId));
+      .map(([docId, score]) => ({ chunk: this._chunks.get(docId), score }));
   }
 
   save(path) {

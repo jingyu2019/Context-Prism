@@ -40,11 +40,14 @@ export class RetrievalConfig {
 export function retrieve(index, query, config = null) {
   const cfg = config || new RetrievalConfig();
   const now = Date.now() / 1000;
-  const chunks = index.search(query, cfg.topK);
+  // Each hit carries the score its own backend computed; a backend without a
+  // scored search falls back to positional scoring.
+  const hits = index.searchWithScores ? index.searchWithScores(query, cfg.topK) : toScoredHits(index.search(query, cfg.topK));
   const queryVector = cfg.useSemantic ? embedText(query) : null;
   const items = [];
-  for (const chunk of chunks) {
-    let score = cfg.relevanceWeight * bm25RankScore(chunk, chunks);
+  for (const hit of hits) {
+    const chunk = hit.chunk;
+    let score = cfg.relevanceWeight * normalizeHitScore(hit.score);
     let semantic = 0;
     if (queryVector) {
       semantic = cosineSimilarity(queryVector, chunkEmbedding(chunk));
@@ -56,7 +59,7 @@ export function retrieve(index, query, config = null) {
     score += cfg.recencyWeight * recency;
     score += cfg.sourceWeight * (sourceBoost - 1.0);
     score += cfg.priorityWeight * (chunk.priority / 10.0);
-    const reasons = [`bm25=${bm25RankScore(chunk, chunks).toFixed(3)}`];
+    const reasons = [`bm25=${normalizeHitScore(hit.score).toFixed(3)}`];
     if (semantic > 0) reasons.push(`sem=${semantic.toFixed(3)}`);
     if (recency > 0.8) reasons.push("recent");
     if (chunk.priority > 0) reasons.push(`priority=${chunk.priority}`);
@@ -73,8 +76,35 @@ function chunkEmbedding(chunk) {
   return embeddingCache.get(chunk.id);
 }
 
-function bm25RankScore(chunk, rankedChunks) {
-  const rank = rankedChunks.indexOf(chunk);
-  if (rank < 0 || rankedChunks.length === 0) return 0;
-  return Math.max(0, 1 - rank / rankedChunks.length);
+/** Wrap bare chunks as positional hits for an index without a scored search. */
+function toScoredHits(chunks) {
+  return chunks.map((chunk, position) => ({ chunk, score: chunks.length === 0 ? 0 : 1 - position / chunks.length }));
+}
+
+/**
+ * Fold one backend's raw score into 0..1.
+ *
+ * The two backends report relevance in different units and wildly different
+ * magnitudes:
+ *
+ *   - in-memory BM25: positive, unbounded, typically 0..15
+ *   - SQLite FTS5 `rank`: negative and *tiny* - `-2.4e-6` for a perfect hit,
+ *     because FTS5 divides by corpus-level statistics
+ *
+ * Neither magnitude means anything across backends, so each is mapped through
+ * its own scale; within one backend the mapping is monotone, which is all the
+ * ranking consumes.
+ *
+ *   relevance > 0: s / (s + 1)          BM25 0 -> 0, 1 -> 0.5, 9 -> 0.9
+ *   relevance < 0: k|s| / (k|s| + 1)    FTS5 with k spreading the -1e-6 band
+ */
+const FTS_RANK_SCALE = 1e6;
+
+export function normalizeHitScore(score) {
+  if (!Number.isFinite(score)) return 0;
+  if (score < 0) {
+    const spread = Math.abs(score) * FTS_RANK_SCALE;
+    return Math.min(0.999, spread / (spread + 1));
+  }
+  return score / (score + 1);
 }
