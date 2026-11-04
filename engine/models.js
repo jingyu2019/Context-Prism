@@ -6,7 +6,18 @@ export const SourceKind = Object.freeze({
   FILE: "file",
   PREFERENCE: "preference",
   TRAJECTORY: "trajectory",
+  /** Per-session capture cursor; never retrieved, never rendered into a window. */
+  SESSION_CURSOR: "session_cursor",
 });
+
+/** Kinds that may appear in a context window, in section order. */
+export const RETRIEVABLE_KINDS = Object.freeze([
+  SourceKind.PREFERENCE,
+  SourceKind.HISTORY,
+  SourceKind.TRAJECTORY,
+  SourceKind.CODE,
+  SourceKind.FILE,
+]);
 
 export class Chunk {
   constructor({ id, source, kind, content, metadata = {}, timestamp = null, priority = 0, tokens = 0 }) {
