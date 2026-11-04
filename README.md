@@ -2,7 +2,12 @@
 
 **ContextPrism** 是一个面向 DeepSeek Harness (DSH) 的本地上下文引擎 / 动态 context window 插件。
 
+> **当前版本 v0.8.0，已对齐 DSH `0.2.1-rc.5`。**
+> v0.7.0 的自动注入在默认配置下**从未生效**（空索引 → 空窗口 → 静默丢弃），
+> 详见 [CHANGELOG](CHANGELOG.md#080---2026-11-04) 与 [深度评估](docs/analysis/ROADMAP-REVIEW.md)。
+
 完整架构文档见：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+可优化点与后续方向评估见：[docs/analysis/ROADMAP-REVIEW.md](docs/analysis/ROADMAP-REVIEW.md)
 
 它会在调用任何 LLM 之前，对以下本地数据做 **retrieval / compression / prioritization**：
 
@@ -37,11 +42,14 @@
 - **缓存与增量**
   - 检索 / 压缩结果 TTL+LRU 缓存
   - 文件增量 ingest，按 mtime + size 跳过未变更内容
-- **自动捕获 + 自动注入**
-  - 自动把当前会话历史、assistant 消息、tool call / tool result 写入项目索引
+- **自动捕获 + 自动注入（DSH 0.2.1 接缝）**
+  - 通过 `ctx.systemPrompt.context()` 注册每步上下文贡献，由宿主负责投影为带来源归因的消息
+    （宿主没有该服务时自动回落到 `agent/pre-step` 追加消息）
+  - 自动把当前会话历史、assistant 消息、tool call / tool result 写入项目索引，
+    **捕获游标持久化在索引里**，重启不重复、不漏
   - 自动增量索引项目文件（默认 60s 内最多扫描一次）
   - 实时文件监听（`fs.watch` + 防抖重索引）
-  - 在每次 LLM 请求前自动注入动态 context window，模型无需手动调用工具
+  - 注入状态可观测：`context_prism_status` 回报注入次数、空跳过次数、最近错误
 
 ## 目录
 
@@ -55,15 +63,20 @@ Context-Prism/
 │   ├── cache.js
 │   ├── index.js
 │   ├── sqlite_index.js
+│   ├── session_events.js   # 宿主无关的会话事件读取
+│   ├── version.js          # 宿主版本兼容性
 │   ├── retrieval.js
 │   ├── prioritization.js
 │   ├── compression.js
 │   ├── ingest.js
 │   ├── engine.js
 │   └── providers.js
-├── test/                   # Node 测试
+├── test/                   # Node 测试（44）
 │   ├── engine.test.js
-│   └── plugin.test.js
+│   ├── engine_fixes.test.js
+│   ├── plugin.test.js
+│   ├── compat.test.js
+│   └── host.test.js
 └── python/                 # Python 参考实现（可选）
     ├── local_context_engine/
     ├── tests/
@@ -104,7 +117,7 @@ dsh plugin --profile web add github:LFM097384/Context-Prism
 | --- | --- |
 | `context_prism_build` | 在调用 LLM 前构建动态 context window |
 | `context_prism_ingest` | 把文件/目录/history/trajectory 灌入本地索引 |
-| `context_prism_status` | 查看当前项目索引状态（chunk 数量、类型、来源） |
+| `context_prism_status` | 索引状态 + **宿主版本兼容性** + 注入模式与计数 |
 | `context_prism_dashboard` | 生成并保存独立的 HTML 可视化面板到 `.lce/dashboard.html` |
 | `context_prism_evaluate` | 运行 A/B 检索评估（语义+BM25 vs BM25-only） |
 | `context_prism_summarize` | 用 LLM 或本地 extractive 方式总结文本 |
@@ -113,8 +126,20 @@ dsh plugin --profile web add github:LFM097384/Context-Prism
 
 ```bash
 npm install
-npm test
+npm test          # 44 tests
 ```
+
+测试分层：
+
+| 文件 | 覆盖 |
+| --- | --- |
+| `test/engine.test.js` | 引擎基础（分词、BM25、FTS5、压缩、payload） |
+| `test/engine_fixes.test.js` | 本次修复的回归（游标不泄漏、真实 BM25 分数、压缩预算含分隔符） |
+| `test/plugin.test.js` | 工具注册、ingest/build、workspace 扫描、dashboard、A/B 评估 |
+| `test/compat.test.js` | **rc.5 契约**：prompt-context 接缝、块内容解析、参数 DSL、client bundle 种子 |
+| `test/host.test.js` | 在**真实 Cordis 应用**中挂载、可选服务降级、disposer 契约 |
+
+CI 在 Node **22 与 24** 上跑（24 是 DSH 0.2.1 自带运行时）。
 
 ## Python 参考实现
 

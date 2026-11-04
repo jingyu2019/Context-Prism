@@ -1,4 +1,8 @@
 # ContextPrism DSH plugin bundle patch.
+#
+# Mounts the plugin with the defaults this release was verified against on DSH
+# 0.2.1-rc.5. Keep them explicit: a silent default change in a later host should
+# show up here as a diff rather than as a behaviour change nobody noticed.
 
 - insert:
     - id: context-prism
@@ -6,3 +10,11 @@
       config:
         backend: 'auto'
         defaultIndex: '.lce/index.db'
+        autoInject: true
+        autoIndexFiles: true
+        autoMaxTokens: 4000
+        autoReservedTokens: 800
+        autoIndexIntervalMs: 60000
+        fileWatch: true
+        watchDebounceMs: 2000
+        llmSummarization: false
