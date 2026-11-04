@@ -105,11 +105,45 @@ export class SqliteIndex {
     return this.db.prepare("SELECT * FROM chunks ORDER BY rowid").all().map((row) => this._rowToChunk(row));
   }
 
-  chunksByKind(kind) {
-    return this.db
-      .prepare("SELECT * FROM chunks WHERE kind = ? ORDER BY rowid")
-      .all(kind)
-      .map((row) => this._rowToChunk(row));
+  /**
+   * Chunks of one kind, optionally limited to one source.
+   *
+   * With a `source` filter the newest row comes first, so "the latest chunk of
+   * this session" is one indexed read instead of a full scan-and-sort.
+   */
+  chunksByKind(kind, { source = null, limit = null } = {}) {
+    const limitClause = Number.isInteger(limit) && limit > 0 ? " LIMIT ?" : "";
+    const order = source !== null ? " ORDER BY rowid DESC" : " ORDER BY rowid";
+    const statement = this.db.prepare(`SELECT * FROM chunks WHERE kind = ?${source !== null ? " AND source = ?" : ""}${order}${limitClause}`);
+    const params = source !== null ? [kind, source] : [kind];
+    if (limitClause) params.push(limit);
+    return statement.all(...params).map((row) => this._rowToChunk(row));
+  }
+
+  /**
+   * FTS5 search returning each hit's own `rank`.
+   * @returns {{chunk: Chunk, score: number}[]} ordered best first (rank ascending).
+   */
+  searchWithScores(query, topK = 20) {
+    const ftsQuery = this._buildFtsQuery(query);
+    if (ftsQuery) {
+      try {
+        const rows = this.db
+          .prepare(
+            `SELECT c.*, f.rank AS fts_rank
+             FROM chunks_fts f
+             JOIN chunks c ON c.rowid = f.rowid
+             WHERE chunks_fts MATCH ?
+             ORDER BY f.rank
+             LIMIT ?`,
+          )
+          .all(ftsQuery, topK);
+        if (rows.length > 0) return rows.map((row) => ({ chunk: this._rowToChunk(row), score: Number(row.fts_rank) || 0 }));
+      } catch {
+        // FTS syntax issue -> fall through to the LIKE scan below.
+      }
+    }
+    return this.search(query, topK).map((chunk, position, all) => ({ chunk, score: all.length === 0 ? 0 : 1 - position / all.length }));
   }
 
   search(query, topK = 20) {
