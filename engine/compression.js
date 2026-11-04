@@ -3,6 +3,19 @@
 import { estimateTokens } from "./models.js";
 import { splitSentences, termFrequencies, tokenize } from "./text_utils.js";
 
+/**
+ * Tokens a section separator costs once two items are packed together.
+ * `ContextSection` joins items with a blank line and each item is rendered with
+ * its own header, none of which `chunk.tokens` accounts for. Ignoring it made
+ * the assembled section exceed the budget it was packed against.
+ */
+export const PACKING_SEPARATOR_TOKENS = 2;
+
+/** Token cost of `count` packed items, separators included. */
+export function packedTokens(count) {
+  return count <= 0 ? 0 : (count - 1) * PACKING_SEPARATOR_TOKENS;
+}
+
 export class PackedItem {
   constructor({ item, content, tokens, compressed = false }) {
     this.item = item;
@@ -31,18 +44,19 @@ export function compressItems(items, budgetTokens, query = "", minChunkTokens = 
   for (const item of ordered) {
     const content = item.chunk.content;
     const tokens = item.chunk.tokens || estimateTokens(content);
-    if (used + tokens <= budgetTokens) {
+    const separator = packed.length > 0 ? PACKING_SEPARATOR_TOKENS : 0;
+    if (used + separator + tokens <= budgetTokens) {
       packed.push(new PackedItem({ item, content, tokens, compressed: false }));
-      used += tokens;
+      used += separator + tokens;
       continue;
     }
 
-    const remaining = budgetTokens - used;
+    const remaining = budgetTokens - used - separator;
     if (remaining >= minChunkTokens) {
       const [compressed, compressedTokens] = compressChunkToFit(content, remaining, query);
       if (compressedTokens > 0) {
         packed.push(new PackedItem({ item, content: compressed, tokens: compressedTokens, compressed: true }));
-        used += compressedTokens;
+        used += separator + compressedTokens;
         continue;
       }
     }
@@ -64,13 +78,14 @@ export async function compressItemsAsync(items, budgetTokens, query = "", { minC
   for (const item of ordered) {
     const content = item.chunk.content;
     const tokens = item.chunk.tokens || estimateTokens(content);
-    if (used + tokens <= budgetTokens) {
+    const separator = packed.length > 0 ? PACKING_SEPARATOR_TOKENS : 0;
+    if (used + separator + tokens <= budgetTokens) {
       packed.push(new PackedItem({ item, content, tokens, compressed: false }));
-      used += tokens;
+      used += separator + tokens;
       continue;
     }
 
-    const remaining = budgetTokens - used;
+    const remaining = budgetTokens - used - separator;
     if (remaining >= minChunkTokens) {
       let compressed = "";
       if (summarizer) {
@@ -82,7 +97,7 @@ export async function compressItemsAsync(items, budgetTokens, query = "", { minC
       const compressedTokens = estimateTokens(compressed);
       if (compressedTokens > 0) {
         packed.push(new PackedItem({ item, content: compressed, tokens: compressedTokens, compressed: true }));
-        used += compressedTokens;
+        used += separator + compressedTokens;
         continue;
       }
     }
