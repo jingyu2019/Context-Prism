@@ -19,3 +19,11 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+
+# graphify knowledge graph: large generated artifacts stay local, the report is committed
+graphify-out/graph.html
+graphify-out/graph.json
+graphify-out/manifest.json
+graphify-out/cache/
+graphify-out/.graphify_*
+graphify-out/
