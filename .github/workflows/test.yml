@@ -18,5 +18,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: npm ci
+      # `npm install`, not `npm ci`: this repo ships pnpm-lock.yaml and has no
+      # package-lock.json, so `npm ci` has nothing to install from and fails
+      # before reaching the tests. The peer dependencies are DSH internals that
+      # only exist on the registry, so a floating resolve is the honest setup
+      # here; test/compat.test.js asserts the plugin can judge whatever it gets.
+      - run: npm install --no-audit --no-fund
       - run: npm test
