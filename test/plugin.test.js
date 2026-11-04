@@ -89,35 +89,47 @@ test("plugin uses workspace-level default index under .lce", async () => {
   assert.ok(existsSync(join(dir, ".lce", "index.db")));
 });
 
-test("plugin auto-captures session and injects context before LLM step", async () => {
+test("plugin contributes per-step context through the system prompt", async () => {
   const dir = mkdtempSync(join(tmpdir(), "lce-auto-"));
-  const { ctx, listeners } = makeContext(dir);
-  apply(ctx, { backend: "sqlite", defaultIndex: ".lce/index.db", autoIndexFiles: false });
+  const { ctx } = makeContext(dir);
+  const contexts = new Map();
+  ctx.systemPrompt = { context: (contribution) => (contexts.set(contribution.name, contribution), () => {}) };
+  apply(ctx, { backend: "sqlite", defaultIndex: ".lce/index.db", autoIndexFiles: false, fileWatch: false });
 
-  const preStep = listeners["agent/pre-step"]?.[0];
-  assert.ok(preStep, "agent/pre-step listener should be registered");
+  const contribution = contexts.get("context-prism");
+  assert.ok(contribution, "autoInject registers a prompt context");
 
   const events = [
-    { seq: 1, type: "user/message", data: { message: { content: "How should I assemble a dynamic context window?" } }, time: Date.now() },
-    { seq: 2, type: "assistant/message", data: { message: { content: "Use retrieval and compression." } }, time: Date.now() },
+    { seq: 1, type: "user/message", data: { message: { role: "user", content: [{ type: "text", text: "How should I assemble a dynamic context window?" }] } }, time: Date.now() },
+    { seq: 2, type: "assistant/message", data: { message: { content: [{ type: "text", text: "Use retrieval and compression." }] } }, time: Date.now() },
     { seq: 3, type: "tool/call", data: { name: "search_index", arguments: "{}" }, time: Date.now() },
   ];
-  const agent = {
-    id: "auto-test-session",
-    session: {
-      id: "auto-test-session",
-      header: { cwd: dir },
-      events,
-    },
-  };
-  const decision = { kind: "enter", messages: [{ role: "user", content: "How should I assemble a dynamic context window?" }] };
-  const next = async () => decision;
+  const agent = { id: "auto-test-session", session: { id: "auto-test-session", header: { cwd: dir }, events } };
 
-  const result = await preStep({ agent, signal: new AbortController().signal }, next);
-  assert.equal(result.kind, "enter");
-  assert.ok(result.messages.length >= 2);
-  assert.ok(JSON.stringify(result.messages).includes("ContextPrism auto-injected context"));
-  assert.ok(existsSync(join(dir, ".lce", "index.db")));
+  const text = await contribution.text({ agent });
+  assert.match(text, /\[ContextPrism\] local context for this step/);
+  assert.match(text, /dynamic context window/, "the captured question is retrievable");
+  assert.ok(existsSync(join(dir, ".lce", "index.db")), "capture persists into the workspace index");
+});
+
+test("workspace scan indexes text files into the project index", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "lce-scan-"));
+  writeFileSync(join(dir, "notes.md"), "The archive retention policy keeps seven years of audit records.", "utf8");
+  const { ctx, tools } = makeContext(dir);
+  const contexts = new Map();
+  ctx.systemPrompt = { context: (contribution) => (contexts.set(contribution.name, contribution), () => {}) };
+  apply(ctx, { backend: "sqlite", defaultIndex: ".lce/index.db", autoIndexFiles: true, autoIndexIntervalMs: 0, fileWatch: false });
+
+  const agent = { id: "scan-session", session: { id: "scan-session", header: { cwd: dir }, events: [
+    { seq: 1, type: "user/message", data: { message: { role: "user", content: [{ type: "text", text: "What is the archive retention policy?" }] } }, time: Date.now() },
+  ] } };
+  const text = await contexts.get("context-prism").text({ agent });
+  assert.match(text, /seven years/, "files on disk must reach the window, not just session history");
+
+  const status = tools.find((tool) => tool.name === "context_prism_status");
+  const result = await status.execute({}, { agent: { session: { header: { cwd: dir } } } });
+  assert.ok(result.report.totalChunks > 0);
+  assert.ok(result.report.byKind.file >= 1);
 });
 
 test("plugin generates standalone HTML dashboard", async () => {
