@@ -4,7 +4,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, 
 import { dirname, extname, join, resolve } from "node:path";
 
 import { TTLCache } from "./cache.js";
-import { buildOmittedNote, compressItems, compressItemsAsync } from "./compression.js";
+import { buildOmittedNote, compressItems, compressItemsAsync, packedTokens } from "./compression.js";
 import { LocalIndex } from "./index.js";
 import { SqliteIndex } from "./sqlite_index.js";
 import {
@@ -15,6 +15,7 @@ import {
   ingestTrajectoryJsonl,
 } from "./ingest.js";
 import { Chunk, ContextSection, ContextWindow, RetrievedItem, SourceKind, estimateTokens } from "./models.js";
+import { readSessionEvents, sessionIdOf, describeEvent } from "./session_events.js";
 import { PriorityConfig, prioritize } from "./prioritization.js";
 import { RetrievalConfig, retrieve } from "./retrieval.js";
 
@@ -129,6 +130,79 @@ export class LocalContextEngine {
     }
     this._saveState(stateFile, state);
     return { added: totalAdded, changed: totalChanged, skipped: totalSkipped };
+  }
+
+  /**
+   * Capture one session's model-visible events into the index.
+   *
+   * The cursor lives in the index (kind `session_cursor`, keyed by session id),
+   * so capture survives a host restart and is shared by every engine instance
+   * that opens the same index. Re-capturing is idempotent: chunk ids are
+   * derived from (session, type, seq).
+   *
+   * @param {{session: object, cursor: number, limit: number}} options
+   * @returns {{added: number, newUserMessages: number, cursor: number, total: number, skipped: number}}
+   */
+  captureSessionEvents({ session, cursor = 0, limit = 400 } = {}) {
+    const sessionId = sessionIdOf(session);
+    if (!sessionId) return { added: 0, newUserMessages: 0, cursor, total: 0, skipped: 0 };
+    const { events, total } = readSessionEvents(session, { fromSeq: cursor });
+    // Keep the hot path bounded: capture at most `limit` new events per call and
+    // let the next step pick up the remainder.
+    const batch = events.slice(0, limit);
+    const chunks = [];
+    let newUserMessages = 0;
+    let nextCursor = cursor;
+    for (const event of batch) {
+      nextCursor = Math.max(nextCursor, Number(event.seq) || 0);
+      const projected = describeEvent(event, sessionId);
+      if (!projected) continue;
+      if (projected.kind === SourceKind.HISTORY && projected.author === "user") newUserMessages += 1;
+      chunks.push(
+        new Chunk({
+          id: projected.id,
+          source: `session:${sessionId}`,
+          kind: projected.kind,
+          content: projected.content,
+          metadata: { sessionId, seq: event.seq, eventType: event.type },
+          timestamp: event.time ? event.time / 1000 : Date.now() / 1000,
+          priority: projected.priority,
+        }),
+      );
+    }
+    if (chunks.length > 0) this.index.addMany(chunks);
+    if (nextCursor !== cursor) this._writeSessionCursor(sessionId, nextCursor);
+    return {
+      added: chunks.length,
+      newUserMessages,
+      cursor: nextCursor,
+      total,
+      skipped: Math.max(0, events.length - batch.length),
+    };
+  }
+
+  /** Read the persisted capture cursor for one session. */
+  sessionCursor(sessionId) {
+    const chunk = this.index.get(cursorId(sessionId));
+    return chunk ? Number(chunk.metadata?.seq) || 0 : 0;
+  }
+
+  /** Look up this engine's most recent session chunk, for inject-time dedupe. */
+  lastSessionChunk(sessionId) {
+    return this.index.chunksByKind(SourceKind.HISTORY, { source: `session:${sessionId}`, limit: 1 })[0] || null;
+  }
+
+  _writeSessionCursor(sessionId, seq) {
+    this.index.add(
+      new Chunk({
+        id: cursorId(sessionId),
+        source: `session:${sessionId}`,
+        kind: SourceKind.SESSION_CURSOR,
+        content: String(seq),
+        metadata: { sessionId, seq },
+        timestamp: Date.now() / 1000,
+      }),
+    );
   }
 
   clearCaches() {
@@ -328,7 +402,10 @@ export class LocalContextEngine {
 
   _sectionFromResult(title, result) {
     const content = this._renderPacked(result.packed);
-    const tokens = result.packed.reduce((sum, packed) => sum + packed.tokens, 0);
+    // Report the rendered cost, separators included: this number feeds the
+    // budget check for the Omitted Memory note, so understating it lets the
+    // window overshoot the budget it just enforced.
+    const tokens = result.packed.reduce((sum, packed) => sum + packed.tokens, 0) + packedTokens(result.packed.length);
     return new ContextSection({
       title,
       content,
@@ -354,7 +431,7 @@ export class LocalContextEngine {
     for (const [kind, packedList] of grouped) {
       if (packedList.length === 0) continue;
       const content = this._renderPacked(packedList);
-      const tokens = packedList.reduce((sum, packed) => sum + packed.tokens, 0);
+      const tokens = packedList.reduce((sum, packed) => sum + packed.tokens, 0) + packedTokens(packedList.length);
       sections.push(
         new ContextSection({
           title: titles[kind],
@@ -422,4 +499,9 @@ function looksLikeSqlite(path) {
   } catch {
     return false;
   }
+}
+
+/** Stable chunk id for one session's capture cursor. */
+function cursorId(sessionId) {
+  return `session_cursor:${sessionId}`;
 }
