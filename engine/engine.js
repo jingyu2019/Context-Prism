@@ -361,6 +361,8 @@ export class LocalContextEngine {
       droppedCount: presenceFilter.count,
       candidateTokens: presenceFilter.tokens,
       savedTokens: this._savedTokens(options, window, presenceFilter, measureSavings),
+      // The flag, not a 0, tells a reader whether that number was measured.
+      savingsMeasured: measureSavings === true,
     });
   }
 
@@ -461,6 +463,7 @@ export class LocalContextEngine {
       droppedCount: presenceFilter.count,
       candidateTokens: presenceFilter.tokens,
       savedTokens: await this._savedTokensAsync(options, window, presenceFilter, measureSavings),
+      savingsMeasured: measureSavings === true,
     });
   }
 
@@ -561,7 +564,22 @@ export class LocalContextEngine {
     return Math.max(0, materialTokens(control) - materialTokens(window));
   }
 
-  /** Async twin of {@link _savedTokens}; same counterfactual, same units, no LLM. */
+  /**
+   * Async twin of {@link _savedTokens}; same counterfactual, same units, no LLM.
+   *
+   * KNOWN HAZARD (recorded, deliberately not fixed): when the live assembly runs
+   * with `llmSummarization` enabled, that assembly may pack with the summarizer
+   * while this control is forced to extractive compression (`summarizer: null`,
+   * required so measurement never calls a model). The two sides are then packed
+   * by DIFFERENT rules, so a diff of their material would compare a summarized
+   * window against an extractively-packed control rather than measuring the
+   * filter's effect alone.
+   *
+   * No display path opts into async measurement today: `context_prism_build`
+   * opts in, and it only calls the synchronous `buildContext`. Before wiring an
+   * async opt-in, the control's packing must be pinned to the live assembly's
+   * (or the summarizer made deterministic and LLM-free) so the delta is real.
+   */
   async _savedTokensAsync(options, window, presenceFilter, measureSavings) {
     if (!measureSavings || !presenceFilter.active || presenceFilter.count === 0) return 0;
     const control = await this.buildContextAsync({
@@ -748,17 +766,24 @@ function normalizeQuery(query) {
 /**
  * Expose the dedupe accounting on the window it produced.
  *
- * Four numbers, deliberately named so none can be quoted as another:
+ * The numbers are deliberately named so none can be quoted as another:
  *
  *   - `dupDroppedCount` — how many retrieved chunks the predicate removed.
  *   - `dupCandidateTokens` — the candidate pool those chunks were worth. An
  *     UPPER BOUND: a chunk dropped from an over-full pool may never have been
  *     packed, so this is not a saving and must never be quoted as one (a
  *     measured session: pool 59,178 vs realised 31,458, ~1.9x too high).
+ *   - `dupSavingsMeasured` — whether `dupSavedTokens` below is a measurement.
+ *     Measurement is opt-in (`measureSavings`), so most assemblies do not run
+ *     the counterfactual.
  *   - `dupSavedTokens` — the realised saving: tokens the rendered window does
  *     NOT carry that the unfiltered window would have, in the same item-token
  *     units the report uses. THIS is the only number that may be called a
- *     saving.
+ *     saving. When `dupSavingsMeasured` is false it is `null`, never 0: a zero
+ *     means "measured, and nothing was saved", while `null` means "not
+ *     measured". Publishing 0 for both made a report look like the feature had
+ *     saved nothing while `dupCandidateTokens` in the same report showed real
+ *     drops.
  *   - `dupDroppedTokens` — LEGACY ALIAS of `dupCandidateTokens` (the pool).
  *     Retained only because `test/dedupe_falsification.test.js` pins it at
  *     step 1 of its measurement; it carries NO saving semantics. New code must
@@ -770,14 +795,19 @@ function normalizeQuery(query) {
  * this change.
  *
  * @param {object} window - freshly built ContextWindow.
- * @param {{droppedCount?: number, candidateTokens?: number, savedTokens?: number}} [accounting]
+ * @param {{droppedCount?: number, candidateTokens?: number, savedTokens?: number, savingsMeasured?: boolean}} [accounting]
  * @returns {object} the same window.
  */
-function withDedupeReport(window, { droppedCount = 0, candidateTokens = 0, savedTokens = 0 } = {}) {
+function withDedupeReport(
+  window,
+  { droppedCount = 0, candidateTokens = 0, savedTokens = 0, savingsMeasured = false } = {},
+) {
   const fields = {
     dupDroppedCount: droppedCount,
     dupCandidateTokens: candidateTokens,
-    dupSavedTokens: savedTokens,
+    dupSavingsMeasured: savingsMeasured === true,
+    // null, not 0: "not measured" must never read as "nothing saved".
+    dupSavedTokens: savingsMeasured === true ? savedTokens : null,
     dupDroppedTokens: candidateTokens,
   };
   Object.assign(window, fields);

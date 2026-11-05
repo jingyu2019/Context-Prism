@@ -263,7 +263,8 @@ test("the realised saving is reported, and it is NOT the candidate pool", () => 
 
   const plain = control.report();
   assert.equal(plain.dupDroppedCount, 0);
-  assert.equal(plain.dupSavedTokens, 0);
+  assert.equal(plain.dupSavingsMeasured, false, "the control did not measure either");
+  assert.equal(plain.dupSavedTokens, null, "unmeasured is null, not a zero");
   assert.equal(plain.dupCandidateTokens, 0);
 });
 
@@ -559,7 +560,8 @@ test("R-004: measureSavings defaults to false and runs no second assembly", () =
 
   const off = engine.buildContext({ ...BUDGET, presence });
   assert.equal(assemblies, 1, "the default path must not run a second full assembly");
-  assert.equal(off.dupSavedTokens, 0, "not measured must read 0, not a wrong number");
+  assert.equal(off.dupSavingsMeasured, false);
+  assert.equal(off.dupSavedTokens, null, "not measured must be null, not a wrong number");
   assert.ok(off.dupCandidateTokens > 0, "the pool is still reported without measuring");
 
   assemblies = 0;
@@ -600,7 +602,11 @@ test("R-004: the counterfactual never calls the summarizer", async () => {
 
   // The fixture must actually exercise the summarizer, or equality proves nothing.
   assert.ok(without.calls >= 1, `the fixture must summarize at least once, saw ${without.calls}`);
-  assert.equal(without.window.dupSavedTokens, 0);
+  // Not measured is null with the flag false — never 0, which would read as
+  // "nothing was saved" (R-005).
+  assert.equal(without.window.dupSavingsMeasured, false);
+  assert.equal(without.window.dupSavedTokens, null);
+  assert.equal(withMeasurement.window.dupSavingsMeasured, true);
   assert.ok(withMeasurement.window.dupSavedTokens > 0, "the opt-in measurement must report a real saving");
 
   // Zero calls attributable to measurement: the control assembly forces
@@ -610,6 +616,34 @@ test("R-004: the counterfactual never calls the summarizer", async () => {
     without.calls,
     `measurement added ${withMeasurement.calls - without.calls} summarizer call(s)`,
   );
+});
+
+test("R-005: an unmeasured saving is null and flagged, never a zero that reads as no saving", () => {
+  const { engine, presence } = presenceEngine();
+
+  // Not measured — the per-step default — while real drops are still reported.
+  const unmeasured = engine.buildContext({ ...BUDGET, presence });
+  const off = unmeasured.report();
+  assert.ok(off.dupDroppedCount >= 1, "the drops are still reported");
+  assert.ok(off.dupCandidateTokens > 0, "the candidate pool is still reported");
+  assert.equal(off.dupSavingsMeasured, false, "the report must say the saving was not measured");
+  assert.equal(off.dupSavedTokens, null, "an unmeasured saving must not read as 0");
+  assert.equal(unmeasured.dupSavingsMeasured, false);
+  assert.equal(unmeasured.dupSavedTokens, null);
+
+  // Measured with a real saving: a number, with the flag set.
+  const measured = engine.buildContext({ ...BUDGET, presence, measureSavings: true }).report();
+  assert.equal(measured.dupSavingsMeasured, true);
+  assert.equal(typeof measured.dupSavedTokens, "number");
+  assert.ok(measured.dupSavedTokens > 0);
+
+  // Measured AND genuinely zero: 0 is a real answer, distinct from null.
+  const measuredZero = engine
+    .buildContext({ ...BUDGET, presence: buildPresenceIndex([]), measureSavings: true })
+    .report();
+  assert.equal(measuredZero.dupDroppedCount, 0);
+  assert.equal(measuredZero.dupSavingsMeasured, true);
+  assert.equal(measuredZero.dupSavedTokens, 0, "a measured zero means 'nothing was saved'");
 });
 
 // ---------------------------------------------------------------------------
@@ -742,18 +776,30 @@ test("prompt-context reads deriveMessages() behind capability probing and degrad
   // F2 on the shipping surface: it publishes the realised saving under a name
   // that says "saving", and the candidate-pool number under a name that says
   // "candidate" — never the pool aliased as savings.
-  assert.equal(typeof diagnostics.lastInjection.dupSavedTokens, "number");
   assert.equal(typeof diagnostics.lastInjection.dupCandidateTokens, "number");
-  // R-004: the hot path does not measure. A drop really happened (count > 0)
-  // yet the saving reads 0, the honest "not measured" value — the prompt path
-  // must not pay a second assembly for a number only a report reader wants.
+  // R-004/R-005: the hot path does not measure, and an unmeasured saving is
+  // published as null TOGETHER WITH dupSavingsMeasured false. The nullability is
+  // deliberate, not "the number became optional": null means "not measured",
+  // while 0 means "measured, and nothing was saved". A drop really happened
+  // here (count >= 1), so publishing 0 would have read as "this feature saved
+  // nothing" — the misread this repair exists to close.
   assert.ok(diagnostics.lastInjection.dupDroppedCount >= 1, "the filter did drop something");
-  assert.equal(diagnostics.lastInjection.dupSavedTokens, 0, "the hot path must not measure savings");
+  assert.equal(diagnostics.lastInjection.dupSavingsMeasured, false, "the hot path does not measure");
+  assert.equal(diagnostics.lastInjection.dupSavedTokens, null, "unmeasured reads null, never 0");
   assert.equal(
     Object.prototype.hasOwnProperty.call(diagnostics.lastInjection, "dupDroppedTokens"),
     false,
     "the legacy pool alias must not reach the shipping diagnostics",
   );
+
+  // R-005 on the report surface: both the structured report and its rendered
+  // text say the saving was not measured, so a reader never has to read source.
+  const reportTool = tools.find((tool) => tool.name === "context_prism_report");
+  const published = await reportTool.execute({}, { agent });
+  assert.equal(published.report.injection.last.dupSavingsMeasured, false);
+  assert.equal(published.report.injection.last.dupSavedTokens, null);
+  assert.match(published.output, /realised saving NOT measured/, "the text must spell out 'not measured'");
+  assert.match(published.output, /candidate pool \d+ tokens/, "the pool is still shown so the drops are visible");
 
   // (d) Surface that also carries the preference: nothing is left to say.
   session.deriveMessages = () => [
