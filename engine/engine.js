@@ -263,15 +263,23 @@ export class LocalContextEngine {
   // ------------------------------------------------------------------
   // Context building
   // ------------------------------------------------------------------
-  buildContext({
-    query,
-    maxTokens = 8000,
-    reservedOutputTokens = 1024,
-    retrievalConfig = null,
-    priorityConfig = null,
-    includePreferences = true,
-    scope = null,
-  } = {}) {
+  buildContext(options = {}) {
+    const {
+      query,
+      maxTokens = 8000,
+      reservedOutputTokens = 1024,
+      retrievalConfig = null,
+      priorityConfig = null,
+      includePreferences = true,
+      scope = null,
+      presence = null,
+      dedupeAgainstPrompt = true,
+      // Off by default: the counterfactual is a DIAGNOSTIC number, not part of
+      // assembling a window. Turning it on is an explicit opt-in by the few
+      // paths that display it (the build tool), so the per-step hot path never
+      // pays a second assembly for a number only a human reads.
+      measureSavings = false,
+    } = options;
     const budget = Math.max(0, maxTokens - reservedOutputTokens);
     if (budget <= 0) throw new Error("maxTokens must be greater than reservedOutputTokens");
 
@@ -285,12 +293,18 @@ export class LocalContextEngine {
       this.retrievalCache.set(retrievalKey, retrieved);
     }
     const prioritized = prioritize(retrieved, priorityConfig);
+    // One predicate, two outcomes, applied BEFORE anything is compressed or
+    // budgeted: text the live request already carries is duplication and goes;
+    // text it does not carry is project material or history compaction removed,
+    // and leaving it in the pool is exactly what gets it injected — with the
+    // budget the duplicate would have spent.
+    const presenceFilter = this._presenceFilter(presence, dedupeAgainstPrompt);
 
     let prefSection = null;
     let omittedCount = 0;
     let omittedTokens = 0;
     if (includePreferences) {
-      const prefItems = this._preferenceItems(query, config);
+      const prefItems = this._preferenceItems(query, config).filter((item) => presenceFilter.keep(item));
       if (prefItems.length > 0) {
         const prefKey = this._compressionCacheKey(query, budget, prefItems, effectiveScope);
         let prefResult = this.compressionCache.get(prefKey);
@@ -306,7 +320,9 @@ export class LocalContextEngine {
 
     const used = prefSection ? prefSection.tokens : 0;
     const remaining = Math.max(0, budget - used);
-    const nonPrefItems = prioritized.filter((item) => item.chunk.kind !== SourceKind.PREFERENCE);
+    const nonPrefItems = prioritized
+      .filter((item) => item.chunk.kind !== SourceKind.PREFERENCE)
+      .filter((item) => presenceFilter.keep(item));
     const nonPrefKey = this._compressionCacheKey(query, remaining, nonPrefItems, effectiveScope);
     let nonPrefResult = this.compressionCache.get(nonPrefKey);
     if (!nonPrefResult) {
@@ -330,7 +346,7 @@ export class LocalContextEngine {
     }
 
     const totalTokens = sections.reduce((sum, section) => sum + section.tokens, 0);
-    return new ContextWindow({
+    const window = new ContextWindow({
       query,
       sections,
       maxTokens,
@@ -341,18 +357,31 @@ export class LocalContextEngine {
       omittedTokens,
       scope: effectiveScope,
     });
+    return withDedupeReport(window, {
+      droppedCount: presenceFilter.count,
+      candidateTokens: presenceFilter.tokens,
+      savedTokens: this._savedTokens(options, window, presenceFilter, measureSavings),
+    });
   }
 
-  async buildContextAsync({
-    query,
-    maxTokens = 8000,
-    reservedOutputTokens = 1024,
-    retrievalConfig = null,
-    priorityConfig = null,
-    includePreferences = true,
-    summarizer = null,
-    scope = null,
-  } = {}) {
+  async buildContextAsync(options = {}) {
+    const {
+      query,
+      maxTokens = 8000,
+      reservedOutputTokens = 1024,
+      retrievalConfig = null,
+      priorityConfig = null,
+      includePreferences = true,
+      summarizer = null,
+      scope = null,
+      presence = null,
+      dedupeAgainstPrompt = true,
+      // Off by default: the counterfactual is a DIAGNOSTIC number, not part of
+      // assembling a window. Turning it on is an explicit opt-in by the few
+      // paths that display it (the build tool), so the per-step hot path never
+      // pays a second assembly for a number only a human reads.
+      measureSavings = false,
+    } = options;
     const budget = Math.max(0, maxTokens - reservedOutputTokens);
     if (budget <= 0) throw new Error("maxTokens must be greater than reservedOutputTokens");
 
@@ -366,12 +395,16 @@ export class LocalContextEngine {
       this.retrievalCache.set(retrievalKey, retrieved);
     }
     const prioritized = prioritize(retrieved, priorityConfig);
+    // Same predicate as the sync path, and deliberately the same position:
+    // before compression, so a dropped duplicate hands its budget to whatever
+    // survives instead of shrinking the window.
+    const presenceFilter = this._presenceFilter(presence, dedupeAgainstPrompt);
 
     let prefSection = null;
     let omittedCount = 0;
     let omittedTokens = 0;
     if (includePreferences) {
-      const prefItems = this._preferenceItems(query, config);
+      const prefItems = this._preferenceItems(query, config).filter((item) => presenceFilter.keep(item));
       if (prefItems.length > 0) {
         const prefKey = this._compressionCacheKey(query, budget, prefItems, effectiveScope);
         let prefResult = this.compressionCache.get(prefKey);
@@ -387,7 +420,9 @@ export class LocalContextEngine {
 
     const used = prefSection ? prefSection.tokens : 0;
     const remaining = Math.max(0, budget - used);
-    const nonPrefItems = prioritized.filter((item) => item.chunk.kind !== SourceKind.PREFERENCE);
+    const nonPrefItems = prioritized
+      .filter((item) => item.chunk.kind !== SourceKind.PREFERENCE)
+      .filter((item) => presenceFilter.keep(item));
     const nonPrefKey = this._compressionCacheKey(query, remaining, nonPrefItems, effectiveScope);
     let nonPrefResult = this.compressionCache.get(nonPrefKey);
     if (!nonPrefResult) {
@@ -411,7 +446,7 @@ export class LocalContextEngine {
     }
 
     const totalTokens = sections.reduce((sum, section) => sum + section.tokens, 0);
-    return new ContextWindow({
+    const window = new ContextWindow({
       query,
       sections,
       maxTokens,
@@ -421,6 +456,11 @@ export class LocalContextEngine {
       omittedCount,
       omittedTokens,
       scope: effectiveScope,
+    });
+    return withDedupeReport(window, {
+      droppedCount: presenceFilter.count,
+      candidateTokens: presenceFilter.tokens,
+      savedTokens: await this._savedTokensAsync(options, window, presenceFilter, measureSavings),
     });
   }
 
@@ -436,6 +476,103 @@ export class LocalContextEngine {
   _retrievalConfig(scope, retrievalConfig) {
     if (!retrievalConfig) return new RetrievalConfig({ scope });
     return new RetrievalConfig({ ...retrievalConfig, scope });
+  }
+
+  /**
+   * The presence predicate for one assembly.
+   *
+   * A retrieved chunk whose text the live request already carries is
+   * duplication and is dropped; a chunk whose text it does NOT carry is kept,
+   * because that is either project material the model has not read or history a
+   * compaction `replace` removed — the second half of what this feature must
+   * preserve, and why this is not "history off by default".
+   *
+   * Inactive (every item kept, zero drops) when there is no presence index, when
+   * the caller passed one without a `contains` method, or when
+   * `dedupeAgainstPrompt` is false. Those paths must be byte-for-byte the old
+   * behaviour.
+   *
+   * @param {{contains: (text: unknown) => boolean}|null} presence
+   * @param {boolean} enabled
+   * @returns {{active: boolean, keep: (item: object) => boolean, count: number, tokens: number}}
+   */
+  _presenceFilter(presence, enabled) {
+    const active = enabled !== false && presence != null && typeof presence.contains === "function";
+    // Mutated by `keep`, read only after filtering: a counter, not control flow.
+    const stats = { count: 0, tokens: 0 };
+    return {
+      keep(item) {
+        if (!active) return true;
+        const content = item?.chunk?.content;
+        if (!presence.contains(content)) return true;
+        stats.count += 1;
+        stats.tokens += item.chunk.tokens || estimateTokens(content);
+        return false;
+      },
+      get active() {
+        return active;
+      },
+      get count() {
+        return stats.count;
+      },
+      get tokens() {
+        return stats.tokens;
+      },
+    };
+  }
+
+  /**
+   * Tokens this assembly actually avoided injecting.
+   *
+   * The candidate-pool total is NOT a saving. An item dropped from an over-full
+   * pool may never have been packed anyway, so counting it overstates the win —
+   * a measured session showed a 59,178-token pool against a 31,458-token
+   * realised delta, a ~1.9x false claim. The only honest figure is the
+   * counterfactual: assemble the same window WITHOUT the filter and diff the
+   * material the two windows carry.
+   *
+   * Two hard constraints on that counterfactual:
+   *
+   *   1. It NEVER reaches an LLM. `summarizer: null` is forced (and
+   *      `measureSavings: false` stops recursion), so the control uses
+   *      extractive compression only. A feature built to save tokens must not
+   *      spend model calls to report how many it saved.
+   *   2. It is OFF by default (`measureSavings` defaults to false). Only the
+   *      diagnostic paths that actually display `dupSavedTokens` opt in, so the
+   *      per-step prompt assembly never pays for a second full assembly unless
+   *      asked.
+   *
+   * @param {object} options - the original buildContext options.
+   * @param {object} window - the filtered window.
+   * @param {{active: boolean, count: number}} presenceFilter
+   * @param {boolean} measureSavings - explicit opt-in; false disables measurement.
+   * @returns {number} realised saving in report item-token units, never negative.
+   */
+  _savedTokens(options, window, presenceFilter, measureSavings) {
+    if (!measureSavings || !presenceFilter.active || presenceFilter.count === 0) return 0;
+    const control = this.buildContext({
+      ...options,
+      presence: null,
+      dedupeAgainstPrompt: false,
+      measureSavings: false,
+      // Material accounting needs packed material, never a summarized render.
+      summarizer: null,
+    });
+    return Math.max(0, materialTokens(control) - materialTokens(window));
+  }
+
+  /** Async twin of {@link _savedTokens}; same counterfactual, same units, no LLM. */
+  async _savedTokensAsync(options, window, presenceFilter, measureSavings) {
+    if (!measureSavings || !presenceFilter.active || presenceFilter.count === 0) return 0;
+    const control = await this.buildContextAsync({
+      ...options,
+      presence: null,
+      dedupeAgainstPrompt: false,
+      measureSavings: false,
+      // Force extractive compression: measurement must never call a model.
+      summarizer: null,
+    });
+    return Math.max(0, materialTokens(control) - materialTokens(window));
   }
 
   /**
@@ -606,6 +743,70 @@ function resolveScope(explicitScope, retrievalConfig) {
 /** Canonical query text for cache keys: whitespace-normalized, lowercased. */
 function normalizeQuery(query) {
   return String(query ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * Expose the dedupe accounting on the window it produced.
+ *
+ * Four numbers, deliberately named so none can be quoted as another:
+ *
+ *   - `dupDroppedCount` — how many retrieved chunks the predicate removed.
+ *   - `dupCandidateTokens` — the candidate pool those chunks were worth. An
+ *     UPPER BOUND: a chunk dropped from an over-full pool may never have been
+ *     packed, so this is not a saving and must never be quoted as one (a
+ *     measured session: pool 59,178 vs realised 31,458, ~1.9x too high).
+ *   - `dupSavedTokens` — the realised saving: tokens the rendered window does
+ *     NOT carry that the unfiltered window would have, in the same item-token
+ *     units the report uses. THIS is the only number that may be called a
+ *     saving.
+ *   - `dupDroppedTokens` — LEGACY ALIAS of `dupCandidateTokens` (the pool).
+ *     Retained only because `test/dedupe_falsification.test.js` pins it at
+ *     step 1 of its measurement; it carries NO saving semantics. New code must
+ *     read `dupSavedTokens` for savings and `dupCandidateTokens` for the pool,
+ *     and the shipping diagnostics in `lib/index.js` publish only those two.
+ *
+ * They live on the window instance (and on its report) rather than in
+ * `models.js`, which owns the stable ContextWindow shape and is not part of
+ * this change.
+ *
+ * @param {object} window - freshly built ContextWindow.
+ * @param {{droppedCount?: number, candidateTokens?: number, savedTokens?: number}} [accounting]
+ * @returns {object} the same window.
+ */
+function withDedupeReport(window, { droppedCount = 0, candidateTokens = 0, savedTokens = 0 } = {}) {
+  const fields = {
+    dupDroppedCount: droppedCount,
+    dupCandidateTokens: candidateTokens,
+    dupSavedTokens: savedTokens,
+    dupDroppedTokens: candidateTokens,
+  };
+  Object.assign(window, fields);
+  const report = window.report.bind(window);
+  window.report = () => ({ ...report(), ...fields });
+  return window;
+}
+
+/**
+ * Tokens of the material a window carries, in report item-token units.
+ *
+ * Same convention as `ContextWindow.report()` per-item `tokens` (and as the
+ * independent verification harness): the advisory "Omitted Memory" note is not
+ * injected material and is excluded. Used to diff a filtered window against its
+ * counterfactual.
+ *
+ * @param {object} window - a ContextWindow.
+ * @returns {number}
+ */
+function materialTokens(window) {
+  let total = 0;
+  for (const section of window.sections ?? []) {
+    if (section.title === "Omitted Memory") continue;
+    for (const item of section.items ?? []) {
+      const chunk = item.chunk;
+      total += chunk.tokens > 0 ? chunk.tokens : estimateTokens(chunk.content);
+    }
+  }
+  return total;
 }
 
 /**

@@ -15,6 +15,9 @@
 // string-only reader loses every event.
 
 import { SourceKind } from "./models.js";
+// One spelling for a tool invocation, shared with presence: capture must not
+// invent its own marker or the chunk can never match the live block.
+import { toolCallText } from "./presence.js";
 
 /**
  * Extract plain text from a message or a content-block array.
@@ -31,7 +34,7 @@ export function blocksToText(content) {
       if (typeof block === "string") parts.push(block);
       else if (block.type === "text" && typeof block.text === "string") parts.push(block.text);
       else if (block.type === "image") parts.push("[image]");
-      else if (block.type === "tool-call") parts.push(`[tool-call ${block.name || ""}]`);
+      else if (block.type === "tool-call") parts.push(toolCallText(block));
     }
     return parts.join("\n").trim();
   }
@@ -140,10 +143,11 @@ export function describeEvent(event, sessionId) {
   }
 
   if (type === "tool/call") {
+    // Same spelling as the message path and presence (presence.js toolCallText):
+    // a chunk captured from this event must match the live `tool-call` block.
     const name = event.data?.name || event.data?.tool || "tool";
     const args = event.data?.arguments ?? event.data?.input;
-    const text = args == null ? "" : typeof args === "string" ? args : JSON.stringify(args);
-    const content = `[tool/call ${name}] ${text}`.trim();
+    const content = toolCallText({ name, arguments: args });
     return { id: id("tool-call"), kind: SourceKind.TRAJECTORY, content: content.slice(0, 2000), priority: 0.25 };
   }
 
