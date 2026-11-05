@@ -28,7 +28,7 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "test": "node --test test/engine.test.js test/plugin.test.js test/compat.test.js test/engine_fixes.test.js test/host.test.js",
+    "test": "node --test test/*.test.js",
     "test:compat": "node --test test/compat.test.js"
   },
   "engines": {

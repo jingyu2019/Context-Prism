@@ -144,7 +144,10 @@ test("new events after a cursor are captured on the next step", async (t) => {
   await contribution.text({ agent: { id: session.id, session } });
   session.events.push({ seq: 4, time: Date.now(), type: "user/message", data: createUserMessage({ content: [{ type: "text", text: "and how do I raise the budget?" }], source: { kind: "user" } }) });
   const text = await contribution.text({ agent: { id: session.id, session } });
-  assert.match(text, /New session events captured: 2/, "the new user message and its tool call are both new");
+  // Exactly one event is new: the user message at seq 4. The tool/call at seq 3
+  // was already captured by the first step (which advanced the cursor to 3), and
+  // the capture cursor is exclusive, so it is not re-read or counted again.
+  assert.match(text, /New session events captured: 1\b/, "only the new user message is new; the tool/call at seq 3 was captured in the previous step");
   const engine = new LocalContextEngine({ storagePath: join(dir, ".lce/index.db"), backend: "sqlite" });
   assert.equal(engine.sessionCursor(session.id), 4);
 });
@@ -218,9 +221,14 @@ test("tool schemas compile under the rc.5 parameter DSL", (t) => {
     "context_prism_dashboard",
     "context_prism_evaluate",
     "context_prism_ingest",
+    "context_prism_report",
     "context_prism_status",
     "context_prism_summarize",
   ]);
+  // `context_prism_report` is the structured view the client panel renders.
+  const report = tools.find((tool) => tool.name === "context_prism_report");
+  assert.ok(report, "the structured report tool must be registered");
+  assert.ok(report.output.schema.properties.report, "it returns a structured report object");
   for (const tool of tools) {
     assert.equal(tool.parameters.type, "object", `${tool.name} parameters must be an object root`);
     assert.equal(typeof tool.output.render, "function");
@@ -260,6 +268,36 @@ test("client bundle requires only the seeds its manifest declares", async () => 
   assert.equal(pkg.dsh.client.platform, "web");
   assert.match(source, /__ModuleLoader__\.load\(/, "a client bundle registers a factory");
   assert.match(source, /id:\s*"context-prism-dsh-plugin"/, "the factory id must match the package name");
+});
+
+test("the client panel renders the structured report in place", async () => {
+  const fs = await import("node:fs/promises");
+  const source = await fs.readFile(new URL("../lib/client.js", import.meta.url), "utf8");
+
+  // Scan executable code, not prose. The header of lib/client.js explains *why*
+  // it avoids these APIs, and a bare-word scan would fail on that explanation
+  // instead of on a use of the API — so comments are stripped once, here, and the
+  // patterns below stay exact. Do not "simplify" this back to a bare identifier.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+  // D12: the sidebar action used to open a separate document.
+  assert.doesNotMatch(code, /window\.open/, "no separate tab: the panel renders inside the shell");
+  assert.doesNotMatch(code, /dangerouslySetInnerHTML\s*[:=]/, "no host- or contract-produced HTML inside the panel");
+  assert.match(source, /\/context-prism\/report/, "the panel reads the structured report route");
+  assert.match(source, /encodeURIComponent/, "the project it asks for is encoded, not concatenated raw");
+
+  // It renders the report's own fields rather than a second data path.
+  for (const field of ["counts", "byKind", "byScope", "sessions", "injection", "host"]) {
+    assert.match(source, new RegExp(field), `the panel renders ${field}`);
+  }
+
+  // Failure paths are visible: an error branch that names the status.
+  assert.match(source, /view\.status === "error"/, "a failed fetch renders an error state");
+  assert.match(source, /could not load its report/, "the error says what failed");
+
+  // Still only the declared seed.
+  const required = [...source.matchAll(/require\("([^"]+)"\)/g)].map((match) => match[1]);
+  assert.deepEqual(required, ["react"], "react is the only module the panel loads");
 });
 
 test("status reports host compatibility and injection mode", async (t) => {

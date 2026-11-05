@@ -19,6 +19,50 @@ export const RETRIEVABLE_KINDS = Object.freeze([
   SourceKind.FILE,
 ]);
 
+/**
+ * Kinds that belong to one session: a `history` / `trajectory` chunk captured
+ * from session A is A's private memory, not the project's.
+ */
+export const SESSION_SCOPED_KINDS = Object.freeze([SourceKind.HISTORY, SourceKind.TRAJECTORY]);
+
+/** Kinds that belong to the project and are visible to every session. */
+export const PROJECT_SCOPED_KINDS = Object.freeze([SourceKind.PREFERENCE, SourceKind.CODE, SourceKind.FILE]);
+
+/**
+ * The session that owns this chunk, or null when the chunk belongs to the project.
+ *
+ * `metadata.sessionId` is authoritative when present; otherwise the capture-time
+ * `session:<id>` source convention decides; anything else (an imported JSONL
+ * corpus, seed data) is unowned and therefore project-wide.
+ *
+ * @param {object|null|undefined} chunk
+ * @returns {string|null}
+ */
+export function sessionScopeOf(chunk) {
+  const fromMetadata = chunk?.metadata?.sessionId;
+  if (typeof fromMetadata === "string" && fromMetadata.trim() !== "") return fromMetadata.trim();
+  const fromSource = typeof chunk?.source === "string" ? /^session:(.+)$/.exec(chunk.source) : null;
+  return fromSource ? fromSource[1] : null;
+}
+
+/**
+ * Normative visibility rule — the only definition of "may this chunk appear in
+ * this window". Every read path goes through it; `retrieve()` is the choke
+ * point that applies it before ranking.
+ *
+ * @param {object|null|undefined} chunk
+ * @param {string|null} scope - normalized session scope; null means whole index.
+ * @returns {boolean}
+ */
+export function isVisibleInScope(chunk, scope) {
+  if (!chunk) return false;
+  if (chunk.kind === SourceKind.SESSION_CURSOR) return false; // control record: never visible
+  if (scope === null || scope === undefined) return true; // unscoped: whole project index
+  if (!SESSION_SCOPED_KINDS.includes(chunk.kind)) return true; // project-scoped: always visible
+  const owner = sessionScopeOf(chunk);
+  return owner === null || owner === scope; // foreign session: excluded
+}
+
 export class Chunk {
   constructor({ id, source, kind, content, metadata = {}, timestamp = null, priority = 0, tokens = 0 }) {
     this.id = id;
@@ -51,8 +95,22 @@ export class ContextSection {
 }
 
 export class ContextWindow {
-  constructor({ query, sections = [], maxTokens = 0, reservedOutputTokens = 0, tokenBudget = 0, totalTokens = 0, omittedCount = 0, omittedTokens = 0, createdAt = Date.now() / 1000 }) {
+  constructor({
+    query,
+    sections = [],
+    maxTokens = 0,
+    reservedOutputTokens = 0,
+    tokenBudget = 0,
+    totalTokens = 0,
+    omittedCount = 0,
+    omittedTokens = 0,
+    createdAt = Date.now() / 1000,
+    scope = null,
+  }) {
     this.query = query;
+    // The normalized scope that produced this window: null = whole-index
+    // (CLI/tests), otherwise the one session whose history/trajectory may appear.
+    this.scope = scope;
     this.sections = sections;
     this.maxTokens = maxTokens;
     this.reservedOutputTokens = reservedOutputTokens;
@@ -95,6 +153,7 @@ export class ContextWindow {
       totalTokens: this.totalTokens,
       omittedCount: this.omittedCount,
       omittedTokens: this.omittedTokens,
+      scope: this.scope,
       sections: this.sections.map((section) => ({
         title: section.title,
         tokens: section.tokens,

@@ -1,9 +1,40 @@
 // Lightweight text utilities used by retrieval and compression.
+//
+// Tokenization rules (v0.9, see docs/SPEC-SESSION-ISOLATION.md §4.6 / D9):
+//   - ASCII runs  -> one lowercased token per `[A-Za-z0-9_]+` run (unchanged)
+//   - CJK runs    -> overlapping bigrams `run[i..i+1]`, in text order; a run of
+//                    length 1 emits the single character
+//
+// Why bigrams: a CJK "word" is not space-delimited and a whole run as one token
+// means a short query can only match an identically-sized run. Overlapping
+// bigrams give sub-string granularity in both directions (query and document)
+// at the cost of a bigger term space.
 
 const TOKEN_RE = /[a-zA-Z0-9_]+|[\u4e00-\u9fff]+/g;
+const CJK_RE = /^[\u4e00-\u9fff]+$/;
+
+function isCjkRun(piece) {
+  return CJK_RE.test(piece);
+}
 
 export function tokenize(text) {
-  return Array.from(String(text).matchAll(TOKEN_RE), (m) => m[0].toLowerCase());
+  const tokens = [];
+  for (const match of String(text).matchAll(TOKEN_RE)) {
+    const piece = match[0];
+    if (!isCjkRun(piece)) {
+      tokens.push(piece.toLowerCase());
+      continue;
+    }
+    const length = piece.length;
+    if (length === 1) {
+      tokens.push(piece);
+      continue;
+    }
+    for (let index = 0; index + 1 < length; index += 1) {
+      tokens.push(piece.slice(index, index + 2));
+    }
+  }
+  return tokens;
 }
 
 export function splitSentences(text) {

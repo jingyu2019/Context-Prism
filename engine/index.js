@@ -20,6 +20,23 @@ export class LocalIndex {
     return this._revision;
   }
 
+  /**
+   * Read-only search diagnostics, uniform with `SqliteIndex` (spec §4.5, H4).
+   *
+   * `LocalIndex` has no FTS path and no shadow column, so every field is the
+   * neutral value; the shape is identical so `context_prism_report` never
+   * needs a per-backend conditional.
+   */
+  get diagnostics() {
+    return {
+      ftsErrorCount: 0,
+      likeFallbackCount: 0,
+      likeFallbackRows: 0,
+      lastFallbackAt: null,
+      searchTextMigration: "ok",
+    };
+  }
+
   add(chunk) {
     if (this._chunks.has(chunk.id)) this.remove(chunk.id);
     this._chunks.set(chunk.id, chunk);

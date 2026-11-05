@@ -1,0 +1,41 @@
+{"id":"q01","query":"how does bm25 weight a term that appears in every chunk","goldChunkIds":["bench:retrieval.md#0"],"sessionId":null}
+{"id":"q02","query":"how does the embedding turn a sentence into a fixed-size vector of numbers","goldChunkIds":["bench:retrieval.md#1"],"sessionId":null}
+{"id":"q03","query":"how quickly does the score fade for older captured chunks","goldChunkIds":["bench:retrieval.md#2"],"sessionId":null}
+{"id":"q04","query":"why ask for more candidates than we plan to keep when a session filter is active","goldChunkIds":["bench:retrieval.md#3"],"sessionId":null}
+{"id":"q05","query":"what keeps the two storage backends from producing different rankings","goldChunkIds":["bench:retrieval.md#4"],"sessionId":null}
+{"id":"q06","query":"which captured kinds stay private to one conversation","goldChunkIds":["bench:session-isolation.md#0"],"sessionId":null}
+{"id":"q07","query":"which record tracks capture progress and must never be shown to the model","goldChunkIds":["bench:session-isolation.md#1"],"sessionId":null}
+{"id":"q08","query":"what happens to shared corpora that were imported without an owner","goldChunkIds":["bench:session-isolation.md#2"],"sessionId":null}
+{"id":"q09","query":"why did the cache never hit anything before the key changed shape","goldChunkIds":["bench:session-isolation.md#3"],"sessionId":null}
+{"id":"q10","query":"what does the engine do when a caller passes a number instead of a session id","goldChunkIds":["bench:session-isolation.md#4"],"sessionId":null}
+{"id":"q11","query":"how many characters per chunk and how much overlap between them","goldChunkIds":["bench:ingest.md#0"],"sessionId":null}
+{"id":"q12","query":"what bounds stop a huge directory from flooding the index","goldChunkIds":["bench:ingest.md#1"],"sessionId":null}
+{"id":"q13","query":"why are symbolic links skipped during the directory walk","goldChunkIds":["bench:ingest.md#2"],"sessionId":null}
+{"id":"q14","query":"how do I keep generated folders out of the index","goldChunkIds":["bench:ingest.md#3"],"sessionId":null}
+{"id":"q15","query":"how are Chinese and Japanese characters tokenized without spaces","goldChunkIds":["bench:ingest.md#4"],"sessionId":null}
+{"id":"q16","query":"how does a repeat run avoid re-reading files that did not change","goldChunkIds":["bench:ingest.md#5"],"sessionId":null}
+{"id":"q17","query":"what happens when the maximum tokens minus the reserved output leaves nothing","goldChunkIds":["bench:compression.md#0"],"sessionId":null}
+{"id":"q18","query":"why did a section exceed the budget it was packed against","goldChunkIds":["bench:compression.md#1"],"sessionId":null}
+{"id":"q19","query":"what does the packer try before dropping an item entirely","goldChunkIds":["bench:compression.md#2"],"sessionId":null}
+{"id":"q20","query":"where does the model learn that some memory was dropped","goldChunkIds":["bench:compression.md#3"],"sessionId":null}
+{"id":"q21","query":"are standing instructions ever filtered out by relevance","goldChunkIds":["bench:compression.md#4"],"sessionId":null}
+{"id":"q22","query":"why does the database keep a second copy of the searchable content","goldChunkIds":["bench:sqlite.md#0"],"sessionId":null}
+{"id":"q23","query":"how is a tiny negative database score mapped into a comparable range","goldChunkIds":["bench:sqlite.md#1"],"sessionId":null}
+{"id":"q24","query":"how does an existing database gain a column it never had","goldChunkIds":["bench:sqlite.md#2"],"sessionId":null}
+{"id":"q25","query":"what read-only fields does each backend have to report","goldChunkIds":["bench:sqlite.md#3"],"sessionId":null}
+{"id":"q26","query":"what fraction of the expected chunks landed inside the cutoff","goldChunkIds":["bench:evaluation.md#0"],"sessionId":null}
+{"id":"q27","query":"how is the position of the first correct answer averaged","goldChunkIds":["bench:evaluation.md#1"],"sessionId":null}
+{"id":"q28","query":"why are labels treated as set membership instead of grades","goldChunkIds":["bench:evaluation.md#2"],"sessionId":null}
+{"id":"q29","query":"how expensive is a window that hides the answer in noise","goldChunkIds":["bench:evaluation.md#3"],"sessionId":null}
+{"id":"q30","query":"what is the control that must always score nothing","goldChunkIds":["bench:evaluation.md#4"],"sessionId":null}
+{"id":"q31","query":"where is the index stored and when is memory used instead","goldChunkIds":["bench:operations.md#0"],"sessionId":null}
+{"id":"q32","query":"what is the default cache time to live and entry limit","goldChunkIds":["bench:operations.md#1"],"sessionId":null}
+{"id":"q33","query":"what counts does the report schema include for each session","goldChunkIds":["bench:operations.md#2"],"sessionId":null}
+{"id":"q34","query":"why must the benchmark stay cheap enough to run before shipping","goldChunkIds":["bench:operations.md#3"],"sessionId":null}
+{"id":"q35","query":"how do fixture ids survive a move to another checkout","goldChunkIds":["bench:operations.md#4"],"sessionId":null}
+{"id":"q36","query":"why do separator tokens make a packed section exceed the budget","goldChunkIds":["bench:compression.md#0","bench:compression.md#1"],"sessionId":null}
+{"id":"q37","query":"why is an explicit tie-break needed when the backends return candidates in different scan orders","goldChunkIds":["bench:retrieval.md#4"],"sessionId":null}
+{"id":"q38","query":"which fields must a retrieval cache key include for a session","goldChunkIds":["bench:session-isolation.md#3"],"sessionId":null}
+{"id":"q39","query":"how do we avoid a hang when a shortcut points back at its parent folder","goldChunkIds":["bench:ingest.md#2"],"sessionId":null}
+{"id":"q40","query":"how do I stop two chats from reading each other's notes","goldChunkIds":["bench:session-isolation.md#0"],"sessionId":null}
+{"id":"q41","query":"how do I keep unrelated conversations from bleeding together","goldChunkIds":["bench:session-isolation.md#0"],"sessionId":null}

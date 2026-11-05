@@ -1,7 +1,8 @@
 // The Local Context Engine orchestrator (JS port).
 
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, statSync, writeFileSync } from "node:fs";
-import { dirname, extname, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 import { TTLCache } from "./cache.js";
 import { buildOmittedNote, compressItems, compressItemsAsync, packedTokens } from "./compression.js";
@@ -10,6 +11,7 @@ import { SqliteIndex } from "./sqlite_index.js";
 import {
   chunkText,
   ingestDirectory,
+  ingestDirectoryIncremental,
   ingestFile,
   ingestHistoryJsonl,
   ingestTrajectoryJsonl,
@@ -17,15 +19,17 @@ import {
 import { Chunk, ContextSection, ContextWindow, RetrievedItem, SourceKind, estimateTokens } from "./models.js";
 import { readSessionEvents, sessionIdOf, describeEvent } from "./session_events.js";
 import { PriorityConfig, prioritize } from "./prioritization.js";
-import { RetrievalConfig, retrieve } from "./retrieval.js";
-
-const DEFAULT_DIRECTORY_EXTENSIONS = [".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".txt", ".json", ".jsonl", ".csv", ".html", ".css"];
+import { RetrievalConfig, normalizeScope, retrieve, scoreChunk } from "./retrieval.js";
+import { embedText } from "./embedding.js";
 
 export class LocalContextEngine {
   constructor({ index = null, storagePath = null, backend = "auto", cacheSize = 128, cacheTtl = 60 } = {}) {
     this.storagePath = storagePath ? String(storagePath) : null;
     this.retrievalCache = new TTLCache({ maxsize: cacheSize, ttlSeconds: cacheTtl });
     this.compressionCache = new TTLCache({ maxsize: cacheSize, ttlSeconds: cacheTtl });
+    // Per-session capture guard. Instance state, never module state: two engines
+    // (two indexes) never contend, and dropping the engine drops the guard.
+    this._captureInFlight = new Map();
     if (index) {
       this.index = index;
     } else if (this.storagePath) {
@@ -84,52 +88,38 @@ export class LocalContextEngine {
     return { added: count, changed: count > 0 ? 1 : 0, skipped: 0 };
   }
 
-  addDirectoryIncremental({ directory, kind = null, extensions = null, ignore = [], statePath = null } = {}) {
+  /**
+   * Index a directory incrementally, delegating the walk to `ingest.js`.
+   *
+   * The walk owns the bounds (size cap, volume cap, `.lceignore`, symlink
+   * policy) and returns the complete next state; this method owns persistence
+   * and the index write. `added`/`changed`/`skipped` keep their old meaning and
+   * `sizeSkipped`/`symlinkSkipped` surface what the bounds rejected.
+   *
+   * @returns {{added: number, changed: number, skipped: number, sizeSkipped: number, symlinkSkipped: number}}
+   */
+  addDirectoryIncremental({ directory, kind = null, extensions = null, ignore = [], statePath = null, maxFileBytes = null } = {}) {
     const stateFile = statePath ? String(statePath) : this._defaultStatePath();
     const state = this._loadState(stateFile);
-    const allowed = new Set(extensions || DEFAULT_DIRECTORY_EXTENSIONS);
-    const ignored = new Set(ignore || []);
-    let totalAdded = 0;
-    let totalChanged = 0;
-    let totalSkipped = 0;
-    const currentKeys = new Set();
-
-    const walk = (dir) => {
-      const entries = readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        const full = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          walk(full);
-          continue;
-        }
-        if (!entry.isFile()) continue;
-        if (ignored.size > 0 && full.split(/[\\/]/).some((part) => ignored.has(part))) continue;
-        if (allowed.size > 0 && !allowed.has(extname(full).toLowerCase())) continue;
-        const key = resolve(full);
-        currentKeys.add(key);
-        const stat = statSync(full);
-        const previous = state[key];
-        if (previous && previous.mtime === stat.mtimeMs && previous.size === stat.size) {
-          totalSkipped += 1;
-          continue;
-        }
-        try {
-          const count = this.addFile(full, kind);
-          state[key] = { mtime: stat.mtimeMs, size: stat.size };
-          totalAdded += count;
-          totalChanged += count > 0 ? 1 : 0;
-        } catch {
-          // skip unreadable file
-        }
-      }
+    const { chunks, state: nextState, stats } = ingestDirectoryIncremental({
+      directory,
+      state,
+      kind,
+      extensions,
+      ignore,
+      maxFileBytes,
+    });
+    if (chunks.length > 0) this.addChunks(chunks);
+    // `nextState` covers every file this walk visited, so deleted files are
+    // already absent: persist it verbatim, never merge with the old map.
+    this._saveState(stateFile, nextState);
+    return {
+      added: stats.added,
+      changed: stats.changed,
+      skipped: stats.skipped,
+      sizeSkipped: stats.sizeSkipped,
+      symlinkSkipped: stats.symlinkSkipped,
     };
-    walk(directory);
-
-    for (const key of Object.keys(state)) {
-      if (!currentKeys.has(key) && !existsSync(key)) delete state[key];
-    }
-    this._saveState(stateFile, state);
-    return { added: totalAdded, changed: totalChanged, skipped: totalSkipped };
   }
 
   /**
@@ -138,47 +128,91 @@ export class LocalContextEngine {
    * The cursor lives in the index (kind `session_cursor`, keyed by session id),
    * so capture survives a host restart and is shared by every engine instance
    * that opens the same index. Re-capturing is idempotent: chunk ids are
-   * derived from (session, type, seq).
+   * derived from (session, type, seq) and inserts are upserts.
    *
-   * @param {{session: object, cursor: number, limit: number}} options
-   * @returns {{added: number, newUserMessages: number, cursor: number, total: number, skipped: number}}
+   * Re-entrancy: one capture per session at a time. A second call for a session
+   * whose capture is still in flight is coalesced into a no-op (`reentered:
+   * true`) instead of re-reading and re-writing the same events; the in-flight
+   * call owns both the write and the accounting. Different sessions never
+   * contend — the guard is keyed by session id and holds no global lock.
+   *
+   * @param {{session: object, cursor?: number, limit?: number}} options
+   * @returns {{added: number, newUserMessages: number, cursor: number, total: number, skipped: number, reentered: boolean}}
    */
   captureSessionEvents({ session, cursor = 0, limit = 400 } = {}) {
     const sessionId = sessionIdOf(session);
-    if (!sessionId) return { added: 0, newUserMessages: 0, cursor, total: 0, skipped: 0 };
-    const { events, total } = readSessionEvents(session, { fromSeq: cursor });
-    // Keep the hot path bounded: capture at most `limit` new events per call and
-    // let the next step pick up the remainder.
-    const batch = events.slice(0, limit);
-    const chunks = [];
-    let newUserMessages = 0;
-    let nextCursor = cursor;
-    for (const event of batch) {
-      nextCursor = Math.max(nextCursor, Number(event.seq) || 0);
-      const projected = describeEvent(event, sessionId);
-      if (!projected) continue;
-      if (projected.kind === SourceKind.HISTORY && projected.author === "user") newUserMessages += 1;
-      chunks.push(
-        new Chunk({
-          id: projected.id,
-          source: `session:${sessionId}`,
-          kind: projected.kind,
-          content: projected.content,
-          metadata: { sessionId, seq: event.seq, eventType: event.type },
-          timestamp: event.time ? event.time / 1000 : Date.now() / 1000,
-          priority: projected.priority,
-        }),
-      );
+    if (!sessionId) return { added: 0, newUserMessages: 0, cursor, total: 0, skipped: 0, reentered: false };
+    if (this._captureInFlight.has(sessionId)) {
+      return {
+        added: 0,
+        newUserMessages: 0,
+        cursor: this.sessionCursor(sessionId),
+        total: 0,
+        skipped: 0,
+        reentered: true,
+      };
     }
-    if (chunks.length > 0) this.index.addMany(chunks);
-    if (nextCursor !== cursor) this._writeSessionCursor(sessionId, nextCursor);
-    return {
-      added: chunks.length,
-      newUserMessages,
-      cursor: nextCursor,
-      total,
-      skipped: Math.max(0, events.length - batch.length),
-    };
+    this._captureInFlight.set(sessionId, true);
+    try {
+      // The persisted cursor is authoritative and EXCLUSIVE: it names the last
+      // seq already captured, so reading restarts after it. The cursor chunk's
+      // presence — not its value — distinguishes "nothing captured yet" from
+      // "captured up to seq 0" (seq 0 is a legal event number, and the cursor
+      // value 0 is also what an empty cursor reads as).
+      //
+      // Inclusive reading here was a defect: a no-op assembly re-read the event
+      // at seq === persisted, re-upserted its chunk, overcounted `added` and
+      // bumped index.revision, which invalidated every rev-keyed cache entry on
+      // every turn.
+      const cursorChunk = this.index.get(cursorId(sessionId));
+      const persisted = cursorChunk ? Number(cursorChunk.metadata?.seq) || 0 : 0;
+      const callerCursor = Number(cursor) || 0;
+      const fromSeq = Math.max(callerCursor, cursorChunk ? persisted + 1 : 0);
+      const { events, total } = readSessionEvents(session, { fromSeq });
+      // Keep the hot path bounded: capture at most `limit` new events per call and
+      // let the next step pick up the remainder.
+      const batch = events.slice(0, limit);
+      const chunks = [];
+      let newUserMessages = 0;
+      let nextCursor = fromSeq;
+      for (const event of batch) {
+        nextCursor = Math.max(nextCursor, Number(event.seq) || 0);
+        const projected = describeEvent(event, sessionId);
+        if (!projected) continue;
+        if (projected.kind === SourceKind.HISTORY && projected.author === "user") newUserMessages += 1;
+        chunks.push(
+          new Chunk({
+            id: projected.id,
+            source: `session:${sessionId}`,
+            kind: projected.kind,
+            content: projected.content,
+            metadata: { sessionId, seq: event.seq, eventType: event.type },
+            timestamp: event.time ? event.time / 1000 : Date.now() / 1000,
+            priority: projected.priority,
+          }),
+        );
+      }
+      if (chunks.length > 0) this.index.addMany(chunks);
+      // Monotone write, and only when this read actually moved forward (or when
+      // this is the first capture, which creates the cursor even at seq 0). A
+      // caller that passes a cursor ahead of the session must not be able to
+      // skip events by having that number persisted. A no-op capture writes
+      // nothing, so index.revision — and every cache key derived from it — is
+      // untouched.
+      if (events.length > 0 && (!cursorChunk || nextCursor > persisted)) {
+        this._writeSessionCursor(sessionId, nextCursor);
+      }
+      return {
+        added: chunks.length,
+        newUserMessages,
+        cursor: nextCursor,
+        total,
+        skipped: Math.max(0, events.length - batch.length),
+        reentered: false,
+      };
+    } finally {
+      this._captureInFlight.delete(sessionId);
+    }
   }
 
   /** Read the persisted capture cursor for one session. */
@@ -229,14 +263,25 @@ export class LocalContextEngine {
   // ------------------------------------------------------------------
   // Context building
   // ------------------------------------------------------------------
-  buildContext({ query, maxTokens = 8000, reservedOutputTokens = 1024, retrievalConfig = null, priorityConfig = null, includePreferences = true } = {}) {
+  buildContext({
+    query,
+    maxTokens = 8000,
+    reservedOutputTokens = 1024,
+    retrievalConfig = null,
+    priorityConfig = null,
+    includePreferences = true,
+    scope = null,
+  } = {}) {
     const budget = Math.max(0, maxTokens - reservedOutputTokens);
     if (budget <= 0) throw new Error("maxTokens must be greater than reservedOutputTokens");
 
-    const retrievalKey = this._retrievalCacheKey(query, retrievalConfig);
+    const effectiveScope = resolveScope(scope, retrievalConfig);
+    const config = this._retrievalConfig(effectiveScope, retrievalConfig);
+
+    const retrievalKey = this._retrievalCacheKey(query, config, effectiveScope);
     let retrieved = this.retrievalCache.get(retrievalKey);
     if (!retrieved) {
-      retrieved = retrieve(this.index, query, retrievalConfig);
+      retrieved = retrieve(this.index, query, config);
       this.retrievalCache.set(retrievalKey, retrieved);
     }
     const prioritized = prioritize(retrieved, priorityConfig);
@@ -245,10 +290,9 @@ export class LocalContextEngine {
     let omittedCount = 0;
     let omittedTokens = 0;
     if (includePreferences) {
-      const prefChunks = this.index.chunksByKind(SourceKind.PREFERENCE);
-      if (prefChunks.length > 0) {
-        const prefItems = prefChunks.map((chunk, i) => new RetrievedItem({ chunk, score: 10.0 - i * 0.001, reason: "always-include preference" }));
-        const prefKey = this._compressionCacheKey(query, budget, prefItems);
+      const prefItems = this._preferenceItems(query, config);
+      if (prefItems.length > 0) {
+        const prefKey = this._compressionCacheKey(query, budget, prefItems, effectiveScope);
         let prefResult = this.compressionCache.get(prefKey);
         if (!prefResult) {
           prefResult = compressItems(prefItems, budget, query);
@@ -263,7 +307,7 @@ export class LocalContextEngine {
     const used = prefSection ? prefSection.tokens : 0;
     const remaining = Math.max(0, budget - used);
     const nonPrefItems = prioritized.filter((item) => item.chunk.kind !== SourceKind.PREFERENCE);
-    const nonPrefKey = this._compressionCacheKey(query, remaining, nonPrefItems);
+    const nonPrefKey = this._compressionCacheKey(query, remaining, nonPrefItems, effectiveScope);
     let nonPrefResult = this.compressionCache.get(nonPrefKey);
     if (!nonPrefResult) {
       nonPrefResult = compressItems(nonPrefItems, remaining, query);
@@ -295,6 +339,7 @@ export class LocalContextEngine {
       totalTokens,
       omittedCount,
       omittedTokens,
+      scope: effectiveScope,
     });
   }
 
@@ -306,14 +351,18 @@ export class LocalContextEngine {
     priorityConfig = null,
     includePreferences = true,
     summarizer = null,
+    scope = null,
   } = {}) {
     const budget = Math.max(0, maxTokens - reservedOutputTokens);
     if (budget <= 0) throw new Error("maxTokens must be greater than reservedOutputTokens");
 
-    const retrievalKey = this._retrievalCacheKey(query, retrievalConfig);
+    const effectiveScope = resolveScope(scope, retrievalConfig);
+    const config = this._retrievalConfig(effectiveScope, retrievalConfig);
+
+    const retrievalKey = this._retrievalCacheKey(query, config, effectiveScope);
     let retrieved = this.retrievalCache.get(retrievalKey);
     if (!retrieved) {
-      retrieved = retrieve(this.index, query, retrievalConfig);
+      retrieved = retrieve(this.index, query, config);
       this.retrievalCache.set(retrievalKey, retrieved);
     }
     const prioritized = prioritize(retrieved, priorityConfig);
@@ -322,10 +371,9 @@ export class LocalContextEngine {
     let omittedCount = 0;
     let omittedTokens = 0;
     if (includePreferences) {
-      const prefChunks = this.index.chunksByKind(SourceKind.PREFERENCE);
-      if (prefChunks.length > 0) {
-        const prefItems = prefChunks.map((chunk, i) => new RetrievedItem({ chunk, score: 10.0 - i * 0.001, reason: "always-include preference" }));
-        const prefKey = this._compressionCacheKey(query, budget, prefItems);
+      const prefItems = this._preferenceItems(query, config);
+      if (prefItems.length > 0) {
+        const prefKey = this._compressionCacheKey(query, budget, prefItems, effectiveScope);
         let prefResult = this.compressionCache.get(prefKey);
         if (!prefResult) {
           prefResult = await compressItemsAsync(prefItems, budget, query, { summarizer });
@@ -340,7 +388,7 @@ export class LocalContextEngine {
     const used = prefSection ? prefSection.tokens : 0;
     const remaining = Math.max(0, budget - used);
     const nonPrefItems = prioritized.filter((item) => item.chunk.kind !== SourceKind.PREFERENCE);
-    const nonPrefKey = this._compressionCacheKey(query, remaining, nonPrefItems);
+    const nonPrefKey = this._compressionCacheKey(query, remaining, nonPrefItems, effectiveScope);
     let nonPrefResult = this.compressionCache.get(nonPrefKey);
     if (!nonPrefResult) {
       nonPrefResult = await compressItemsAsync(nonPrefItems, remaining, query, { summarizer });
@@ -372,32 +420,85 @@ export class LocalContextEngine {
       totalTokens,
       omittedCount,
       omittedTokens,
+      scope: effectiveScope,
     });
   }
 
   // ------------------------------------------------------------------
   // Internal helpers
   // ------------------------------------------------------------------
-  _retrievalCacheKey(query, config) {
-    return ["retrieve", this.index.revision, String(query).trim().toLowerCase(), this._retrievalConfigFingerprint(config)];
+  /**
+   * Which RetrievalConfig an assembly actually uses.
+   *
+   * The scope has to live on the config, because `retrieve()` reads it from
+   * there: one place decides what is visible, not two.
+   */
+  _retrievalConfig(scope, retrievalConfig) {
+    if (!retrievalConfig) return new RetrievalConfig({ scope });
+    return new RetrievalConfig({ ...retrievalConfig, scope });
   }
 
-  _retrievalConfigFingerprint(config) {
-    if (!config) return null;
-    return [
-      config.relevanceWeight,
-      config.recencyWeight,
-      config.sourceWeight,
-      config.priorityWeight,
-      config.recencyHalfLifeDays,
-      config.topK,
-      Object.entries(config.sourceWeights).sort(([a], [b]) => a.localeCompare(b)),
-    ];
+  /**
+   * Preferences are always included, but their order follows the query.
+   *
+   * The old `10.0 - i * 0.001` ladder scored a preference by its storage
+   * position, so the section came out identical for every query. Now they go
+   * through the same formula as everything else — backend relevance, then the
+   * shared weights — and every preference is still included; a chunk with no
+   * overlap simply sorts last.
+   *
+   * @returns {RetrievedItem[]} every PREFERENCE chunk, score desc, tie-break id asc
+   */
+  _preferenceItems(query, config) {
+    const chunks = this.index.chunksByKind(SourceKind.PREFERENCE);
+    if (chunks.length === 0) return [];
+    const rawScores = new Map();
+    if (typeof this.index.searchWithScores === "function") {
+      const hits = this.index.searchWithScores(query, Math.max(chunks.length, 20));
+      for (const hit of hits) rawScores.set(hit.chunk.id, hit.score);
+    }
+    const now = Date.now() / 1000;
+    const queryVector = config.useSemantic ? embedText(query ?? "") : null;
+    const items = chunks.map((chunk) => {
+      const { score, reason } = scoreChunk({
+        chunk,
+        rawScore: rawScores.get(chunk.id) ?? 0,
+        queryVector,
+        config,
+        now,
+      });
+      return new RetrievedItem({ chunk, score, reason: `always-include; ${reason}` });
+    });
+    items.sort((a, b) => b.score - a.score || String(a.chunk.id).localeCompare(String(b.chunk.id)));
+    return items;
   }
 
-  _compressionCacheKey(query, budget, items) {
-    const itemSig = items.map((item) => [item.chunk.id, Math.round(item.score * 1e6) / 1e6]);
-    return ["compress", this.index.revision, String(query).trim().toLowerCase(), budget, itemSig];
+  /**
+   * Cache key for one retrieval — a STRING.
+   *
+   * The cache is a Map, and object keys compare by identity: the old array key
+   * meant every lookup missed, so the caches never served anything. Making the
+   * key a string is what activates them, which is exactly why the scope has to
+   * be in it on the same change — otherwise session B is handed A's window.
+   *
+   * `JSON.stringify(scope)` renders null as `s:null` and a session as
+   * `s:"sess-1"`, so no real session id can collide with the unscoped value.
+   */
+  _retrievalCacheKey(query, config, scope) {
+    return `v1|retrieve|rev:${this.index.revision}|s:${JSON.stringify(scope)}|q:${normalizeQuery(query)}|cfg:${JSON.stringify(configFingerprint(config))}`;
+  }
+
+  /**
+   * Cache key for one compression.
+   *
+   * Scope *and* the item signature: the signature pins the payload, the scope
+   * pins the policy, so a change in either can never reuse a foreign result.
+   */
+  _compressionCacheKey(query, budget, items, scope) {
+    const signature = createHash("sha1")
+      .update(JSON.stringify(items.map((item) => [item.chunk.id, Math.round(item.score * 1e6) / 1e6])))
+      .digest("hex");
+    return `v1|compress|rev:${this.index.revision}|s:${JSON.stringify(scope)}|q:${normalizeQuery(query)}|b:${budget}|items:${signature}`;
   }
 
   _sectionFromResult(title, result) {
@@ -485,6 +586,50 @@ export class LocalContextEngine {
     writeFileSync(path, JSON.stringify(state, null, 2), "utf8");
   }
 }
+
+/**
+ * Reconcile the explicit `scope` option with `retrievalConfig.scope`.
+ *
+ * Precedence: the argument wins, the config is the fallback. Two non-null values
+ * that disagree throw instead of silently picking one — a wrong scope is a leak,
+ * not a preference.
+ */
+function resolveScope(explicitScope, retrievalConfig) {
+  const fromArgument = normalizeScope(explicitScope);
+  const fromConfig = retrievalConfig ? normalizeScope(retrievalConfig.scope) : null;
+  if (fromArgument !== null && fromConfig !== null && fromArgument !== fromConfig) {
+    throw new TypeError(`conflicting session scope: argument "${fromArgument}" vs retrievalConfig "${fromConfig}"`);
+  }
+  return fromArgument ?? fromConfig;
+}
+
+/** Canonical query text for cache keys: whitespace-normalized, lowercased. */
+function normalizeQuery(query) {
+  return String(query ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * Everything that changes a ranking, in a fixed order.
+ *
+ * `semanticWeight` and `useSemantic` belong here because they change the score:
+ * without them a `bm25-only` request could be served a cached `hybrid` result,
+ * which is exactly the comparison the evaluator exists to make.
+ */
+function configFingerprint(config) {
+  if (!config) return null;
+  return [
+    config.relevanceWeight,
+    config.semanticWeight,
+    config.recencyWeight,
+    config.sourceWeight,
+    config.priorityWeight,
+    config.recencyHalfLifeDays,
+    config.topK,
+    config.useSemantic,
+    Object.entries(config.sourceWeights).sort(([a], [b]) => a.localeCompare(b)),
+  ];
+}
+
 
 function looksLikeSqlite(path) {
   try {
